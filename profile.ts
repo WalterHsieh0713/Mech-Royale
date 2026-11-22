@@ -87,7 +87,7 @@ export const PROFILES: Record<string, Profile> = {
   },
 }
 
-export const DEFAULT_PROFILE = "survivor"
+export const DEFAULT_PROFILE = "duel"
 
 export function resolveProfile(spec?: string | Partial<Profile>): Profile {
   if (spec && typeof spec === "object") return { ...PROFILES[spec.name ?? DEFAULT_PROFILE] ?? base, ...spec }

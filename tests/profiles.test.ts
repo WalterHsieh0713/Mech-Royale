@@ -1,10 +1,12 @@
 import assert from "node:assert/strict"
 // Decisions must not depend on machine speed in tests.
 process.env.MR_PLAN_BUDGET = "off"
+// These tests describe the survivor profile unless they name another.
+process.env.MR_STRATEGY ??= "survivor"
 import { test } from "node:test"
 import { makeBot } from "../bot.ts"
 import { GameMap } from "../map.ts"
-import { PROFILES, resolveProfile } from "../profile.ts"
+import { DEFAULT_PROFILE, PROFILES, resolveProfile } from "../profile.ts"
 import { finalDuel, flatArena, hello, observation, passingMech, seedRandom } from "./arena-fixtures.ts"
 
 function fixtureBot(profile?: string, options = {}) {
@@ -19,7 +21,7 @@ const npc = (id: number, pos: [number, number, number]) => ({
 
 test("every named profile resolves, and unknown names fall back to the default", () => {
   for (const name of Object.keys(PROFILES)) assert.equal(resolveProfile(name).name, name)
-  assert.equal(resolveProfile("no-such-profile").name, resolveProfile().name)
+  assert.equal(resolveProfile("no-such-profile").name, DEFAULT_PROFILE)
   assert.equal(resolveProfile({ name: "edge", cubeValue: 9 }).cubeValue, 9)
 })
 
