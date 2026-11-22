@@ -1,9 +1,40 @@
 // Static map model: floor heights, obstacles, clearance, line of sight and A* on a coarse grid.
 
 export type World = any
+type Point = [number, number]
+type RiskAt = (x: number, y: number) => number
+export type RoutePlan = { points: Point[]; status: "reached" | "partial" | "unreachable" }
+type RouteRisk = { length: number; integral: number; peak: number }
 
 const STEP_UP = 1.2
 const MECH_H = 9
+const WALK_CLEARANCE = 2.8
+const SEGMENT_SAMPLE_SPACING = 0.7
+const MAX_RISK = 100
+
+function boundedRisk(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.min(MAX_RISK, value)) : MAX_RISK
+}
+
+function segmentRisk(ax: number, ay: number, bx: number, by: number, riskAt: RiskAt): RouteRisk {
+  const length = Math.hypot(bx - ax, by - ay)
+  const samples = Math.max(1, Math.ceil(length / SEGMENT_SAMPLE_SPACING))
+  let previous = boundedRisk(riskAt(ax, ay))
+  let integral = 0, peak = previous
+  for (let i = 1; i <= samples; i++) {
+    const f = i / samples
+    const risk = boundedRisk(riskAt(ax + (bx - ax) * f, ay + (by - ay) * f))
+    integral += (previous + risk) / 2
+    peak = Math.max(peak, risk)
+    previous = risk
+  }
+  return { length, integral: integral * length / samples, peak }
+}
+
+function noMoreRisk(candidate: RouteRisk, original: RouteRisk): boolean {
+  const epsilon = 1e-6
+  return candidate.integral <= original.integral + epsilon && candidate.peak <= original.peak + epsilon
+}
 
 export class GameMap {
   nx: number
@@ -271,14 +302,43 @@ export class GameMap {
   }
 
   /** Straight walk from a to b stays in cells with clearance >= c. */
-  walkLine(ax: number, ay: number, bx: number, by: number, c = 2.8): boolean {
+  walkLine(ax: number, ay: number, bx: number, by: number, c = WALK_CLEARANCE): boolean {
+    if (!this.inGrid(ax, ay) || !this.inGrid(bx, by)) return false
     const L = Math.hypot(bx - ax, by - ay)
-    const n = Math.max(1, Math.ceil(L / 0.7))
+    const n = Math.max(1, Math.ceil(L / SEGMENT_SAMPLE_SPACING))
     for (let s = 0; s <= n; s++) {
       const f = s / n
       if (this.clear[this.idx(ax + (bx - ax) * f, ay + (by - ay) * f)] < c) return false
     }
     return true
+  }
+
+  private inGrid(x: number, y: number): boolean {
+    return x >= this.minX && y >= this.minY && x <= this.minX + this.nx - 1 && y <= this.minY + this.ny - 1
+  }
+
+  /** Integrate the risk along a polyline, measured from the given start point. */
+  routeRisk(sx: number, sy: number, points: readonly Point[], riskAt: RiskAt): RouteRisk {
+    let x = sx, y = sy
+    let length = 0, integral = 0, peak = boundedRisk(riskAt(sx, sy))
+    for (const [px, py] of points) {
+      const segment = segmentRisk(x, y, px, py, riskAt)
+      length += segment.length
+      integral += segment.integral
+      peak = Math.max(peak, segment.peak)
+      x = px
+      y = py
+    }
+    return { length, integral, peak }
+  }
+
+  /** Check whether traveling directly to the final waypoint preserves the safety of the original route. */
+  canShortcut(sx: number, sy: number, via: readonly Point[], riskAt?: RiskAt, clearance = WALK_CLEARANCE): boolean {
+    const goal = via[via.length - 1]
+    if (!goal || !this.walkLine(sx, sy, goal[0], goal[1], clearance)) return false
+    if (!riskAt || via.length === 1) return true
+    const direct = segmentRisk(sx, sy, goal[0], goal[1], riskAt)
+    return noMoreRisk(direct, this.routeRisk(sx, sy, via, riskAt))
   }
 
   // ---------- coarse A* ----------
@@ -287,6 +347,7 @@ export class GameMap {
   private gScore = new Float32Array(0)
   private came = new Int32Array(0)
   private stamp = new Int32Array(0)
+  private closed = new Int32Array(0)
   private curStamp = 0
 
   toCell(x: number, y: number): number {
@@ -298,8 +359,8 @@ export class GameMap {
     const i = c % this.cnx, j = (c / this.cnx) | 0
     return [this.minX + i * this.cs, this.minY + j * this.cs]
   }
-  nearestWalkable(c: number, maxR = 12): number {
-    if (this.cwalk[c]) return c
+  nearestWalkable(c: number, maxR = 12, accept?: (cell: number) => boolean): number {
+    if (this.cwalk[c] && (!accept || accept(c))) return c
     const ci = c % this.cnx, cj = (c / this.cnx) | 0
     for (let r = 1; r <= maxR; r++) {
       let best = -1, bd = 1e9
@@ -309,22 +370,45 @@ export class GameMap {
           const i = ci + di, j = cj + dj
           if (i < 0 || j < 0 || i >= this.cnx || j >= this.cny) continue
           const k = j * this.cnx + i
-          if (this.cwalk[k]) { const d = di * di + dj * dj; if (d < bd) { bd = d; best = k } }
+          if (!this.cwalk[k]) continue
+          const d = di * di + dj * dj
+          if (d < bd && (!accept || accept(k))) { bd = d; best = k }
         }
       if (best >= 0) return best
     }
     return -1
   }
 
-  /** A* from (sx,sy) to (gx,gy). Returns world waypoints (smoothed) or null. extraCost(cellIndex) adds penalty. */
-  path(sx: number, sy: number, gx: number, gy: number, maxExpand = 60000, extraCost?: (x: number, y: number) => number): [number, number][] | null {
+  /** Compatibility API for callers that do not need to distinguish a partial route. */
+  path(sx: number, sy: number, gx: number, gy: number, maxExpand = 60000, extraCost?: RiskAt): Point[] | null {
+    const route = this.planPath(sx, sy, gx, gy, maxExpand, extraCost)
+    return route.status === "unreachable" ? null : route.points
+  }
+
+  /** A* with bounded extra cost per meter of exposure and a checked route to the exact goal. */
+  planPath(sx: number, sy: number, gx: number, gy: number, maxExpand = 60000, extraCost?: RiskAt): RoutePlan {
+    const unreachable: RoutePlan = { points: [], status: "unreachable" }
     const N = this.cnx * this.cny
+    if (!N || !this.inGrid(sx, sy) || !Number.isFinite(gx) || !Number.isFinite(gy)) return unreachable
+    if (this.clearAt(sx, sy) < WALK_CLEARANCE) return unreachable
     if (this.gScore.length !== N) {
       this.gScore = new Float32Array(N); this.came = new Int32Array(N); this.stamp = new Int32Array(N)
+      this.closed = new Int32Array(N)
     }
-    const s = this.nearestWalkable(this.toCell(sx, sy))
-    const g = this.nearestWalkable(this.toCell(gx, gy))
-    if (s < 0 || g < 0) return null
+    const s = this.nearestWalkable(this.toCell(sx, sy), 12, (cell) => {
+      const [x, y] = this.cellXY(cell)
+      return this.walkLine(sx, sy, x, y)
+    })
+    const goalCell = this.toCell(gx, gy)
+    let g = this.inGrid(gx, gy) && this.clearAt(gx, gy) >= WALK_CLEARANCE
+      ? this.nearestWalkable(goalCell, 12, (cell) => {
+        const [x, y] = this.cellXY(cell)
+        return this.walkLine(x, y, gx, gy)
+      })
+      : -1
+    const exactGoalAttached = g >= 0
+    if (!exactGoalAttached) g = this.nearestWalkable(goalCell)
+    if (s < 0 || g < 0) return unreachable
     this.curStamp++
     const st = this.curStamp
     const cnx = this.cnx
@@ -366,20 +450,26 @@ export class GameMap {
     let bestNode = s, bestH = H(s)
     while (hn > 0 && hn < heap.length - 16) {
       const cur = pop()
+      if (this.closed[cur] === st) continue
       if (cur === g) { found = true; break }
-      if (++expanded > maxExpand) break
-      const ci = cur % cnx, cj = (cur / cnx) | 0
-      const gc = this.gScore[cur]
       const hc = H(cur)
       if (hc < bestH) { bestH = hc; bestNode = cur }
+      if (++expanded > maxExpand) break
+      this.closed[cur] = st
+      const ci = cur % cnx, cj = (cur / cnx) | 0
+      const gc = this.gScore[cur]
+      const x = this.minX + ci * this.cs, y = this.minY + cj * this.cs
       for (let d = 0; d < 8; d++) {
         const ni = ci + DI[d], nj = cj + DJ[d]
         if (ni < 0 || nj < 0 || ni >= cnx || nj >= this.cny) continue
         const nk = nj * cnx + ni
-        if (!this.cwalk[nk]) continue
+        if (!this.cwalk[nk] || this.closed[nk] === st) continue
         if (d >= 4 && (!this.cwalk[cj * cnx + ni] || !this.cwalk[nj * cnx + ci])) continue
+        const nx = this.minX + ni * this.cs, ny = this.minY + nj * this.cs
+        // A coarse edge can pass between fine cells with less clearance than either endpoint.
+        if ((this.ccost[nk] > 1 || this.ccost[cur] > 1) && !this.walkLine(x, y, nx, ny)) continue
         let step = (d >= 4 ? 1.4142 : 1) * (this.ccost[nk] + this.ccost[cur]) * 0.5
-        if (extraCost) step += extraCost(this.minX + ni * this.cs, this.minY + nj * this.cs)
+        if (extraCost) step += segmentRisk(x, y, nx, ny, extraCost).integral / this.cs
         const ng = gc + step
         if (this.stamp[nk] === st && ng >= this.gScore[nk]) continue
         this.stamp[nk] = st; this.gScore[nk] = ng; this.came[nk] = cur
@@ -388,22 +478,51 @@ export class GameMap {
     }
     const end = found ? g : bestNode
     const cells: number[] = []
-    for (let c = end; c >= 0 && cells.length < 5000; c = this.came[c]) { cells.push(c); if (c === s) break }
+    for (let c = end; c >= 0 && cells.length < N; c = this.came[c]) { cells.push(c); if (c === s) break }
     cells.reverse()
     const pts = cells.map((c) => this.cellXY(c))
-    if (found) pts.push([gx, gy])
-    // string pulling
-    const out: [number, number][] = []
+    const reached = found && exactGoalAttached
+    if (reached) pts.push([gx, gy])
+    // Use the original route's cumulative risk to check shortcuts, including their riskiest individual sample.
+    const out: Point[] = []
     let ax = sx, ay = sy
     let i = 0
     while (i < pts.length) {
-      let j = Math.min(pts.length - 1, i + 40)
-      while (j > i && !this.walkLine(ax, ay, pts[j][0], pts[j][1])) j--
-      out.push(pts[j])
+      const last = Math.min(pts.length - 1, i + 40)
+      let j = last
+      if (extraCost) {
+        const original: RouteRisk[] = []
+        let px = ax, py = ay
+        for (let k = i; k <= last; k++) {
+          const [bx, by] = pts[k]
+          const segment = segmentRisk(px, py, bx, by, extraCost)
+          const previous = original[original.length - 1]
+          original.push(previous ? {
+            length: previous.length + segment.length,
+            integral: previous.integral + segment.integral,
+            peak: Math.max(previous.peak, segment.peak),
+          } : segment)
+          px = bx
+          py = by
+        }
+        while (j > i) {
+          const [bx, by] = pts[j]
+          if (this.walkLine(ax, ay, bx, by) &&
+            noMoreRisk(segmentRisk(ax, ay, bx, by, extraCost), original[j - i])) break
+          j--
+        }
+      } else {
+        while (j > i && !this.walkLine(ax, ay, pts[j][0], pts[j][1])) j--
+      }
+      if (!this.walkLine(ax, ay, pts[j][0], pts[j][1])) {
+        return out.length ? { points: out, status: "partial" } : unreachable
+      }
+      if (pts[j][0] !== ax || pts[j][1] !== ay) out.push(pts[j])
       ax = pts[j][0]; ay = pts[j][1]
       i = j + 1
     }
-    return out
+    if (reached) return { points: out, status: "reached" }
+    return out.length ? { points: out, status: "partial" } : unreachable
   }
 }
 

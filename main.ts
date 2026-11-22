@@ -8,7 +8,6 @@ const send = (o: unknown) => process.stdout.write(JSON.stringify(o) + "\n")
 const log = (...a: unknown[]) => console.error(...a)
 
 let bot: { name: string; act(o: any): any } | null = null
-let last: any = {}
 let errors = 0
 let buf = ""
 let queued = false
@@ -22,18 +21,20 @@ function seeded(seed: number) {
 }
 
 function onHello(msg: any) {
+  bot = null
+  errors = 0
   try {
     const dir = msg.map?.dir ?? "/arena"
     const world = JSON.parse(readFileSync(join(dir, "v2/world.json"), "utf8"))
     const tb = readFileSync(join(dir, "v2/terrain.i16"))
     const terrain = new Int16Array(tb.buffer.slice(tb.byteOffset, tb.byteOffset + tb.length))
     const map = new GameMap(world, terrain)
-    bot = makeBot(msg, map, seeded(msg.seed ?? 1))
     // warm up the JIT so the first observations are fast
     for (let i = 0; i < 6; i++) {
       map.path(-200 + i * 60, -100, 200 - i * 30, 150, 50000)
       for (let k = 0; k < 200; k++) map.see(-100 + k, 0, 5, 100, 50 + i, 5)
     }
+    bot = makeBot(msg, map, seeded(msg.seed ?? 1))
   } catch (e) {
     log("init failed", e)
   }
@@ -50,15 +51,18 @@ function handle(lines: string[]) {
     else if (msg.type === "end") process.exit(0)
   }
   if (!latest) return
-  let action: any = {}
+  // A failed observation cannot safely reuse the last movement or boost request.
+  let action: any = { move: [0, 0], boost: false }
   if (bot)
     try {
-      action = bot.act(latest)
-      last = { move: action.move, aim: action.aim, boost: action.boost }
+      const candidate = bot.act(latest)
+      if (!candidate.move.every(Number.isFinite) || (candidate.aim && !candidate.aim.every(Number.isFinite))) {
+        throw new Error("invalid action coordinates")
+      }
+      action = candidate
     } catch (e) {
       errors++
       if (errors <= 5 || errors % 100 === 0) log(`act failed tick ${latest.tick}:`, e)
-      action = { ...last }
     }
   const dbg = action._dbg
   delete action._dbg
