@@ -10,7 +10,7 @@ import { runMatch } from "../sim/engine.ts"
 test("a short simulated match runs every profile without bot errors and is reproducible", () => {
   const { world, terrain } = syntheticTown(3)
   const map = new GameMap(world, terrain)
-  const names = ["survivor", "scaler", "edge", "vulture", "fragger", "placement", "anchor", "farmer"]
+  const names = ["survivor", "scaler", "edge", "vulture", "fragger", "placement", "anchor", "farmer", "duel"]
   const agents = Array.from({ length: 8 }, (_, i) => ({ name: names[i], make: (h: any, m: GameMap, r: () => number) => makeBot(h, m, r, names[i]) }))
   const run = () => runMatch(map, agents, 5, "base", { maxTime: 25 })
   const first = run()

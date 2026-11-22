@@ -30,6 +30,8 @@ export interface Profile {
   drops: boolean
   /** With this many mechs alive (self included) or fewer, hunt the nearest contact. 0 = never. */
   endgameHunt: number
+  /** Duel from the first second instead of hiding: fight back when hit, shoot first when only one rival is watching. */
+  duel: boolean
 }
 
 const base: Profile = {
@@ -45,6 +47,7 @@ const base: Profile = {
   thirdParty: "burst",
   drops: true,
   endgameHunt: 2,
+  duel: false,
 }
 
 export const PROFILES: Record<string, Profile> = {
@@ -74,6 +77,13 @@ export const PROFILES: Record<string, Profile> = {
   hybrid: {
     ...base, name: "hybrid", engage: "favorable", engageRange: 90, cubeValue: 2, lootRange: 130, farmNpcs: true,
     farmCrates: "always", farmUntilRadius: 60, rotation: "edge", thirdParty: "vulture", endgameHunt: 4,
+  },
+  // Josh's live finding (commit 59db422 in FlicXyz/Mech-Royale): always dueling beat hiding,
+  // 11.2 vs 10.7 points over ~210 live free-for-all games each. Same fight rules as that
+  // bot's squad mode, active from the start, with its squad-mode looting.
+  duel: {
+    ...base, name: "duel", duel: true, cubeValue: 1.5, lootRange: 110, farmNpcs: true, farmCrates: "always",
+    farmUntilRadius: 60, drops: true, endgameHunt: 3,
   },
 }
 

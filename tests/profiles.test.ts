@@ -99,3 +99,8 @@ test("a route off a plateau walks off the ledge instead of reporting it unreacha
   }
   assert.ok(pos[0] > 2, `expected to leave the plateau eastward, ended at ${pos}`)
 })
+
+test("the duel profile shoots first at a lone rival that is not watching; survivor lets it pass", () => {
+  assert.equal(fixtureBot("duel").act(passingMech()).fire[0], true)
+  assert.equal(fixtureBot("survivor").act(passingMech()).fire[0], false)
+})

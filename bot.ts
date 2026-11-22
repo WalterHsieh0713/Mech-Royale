@@ -29,11 +29,13 @@ type Track = { id: number; pos: V3; vel: V3; seen: number; hpSeen: number; damag
 type Objective = { kind: "loot" | "cube" | "drop" | "crate" | "npc"; id: number; point: Point; value: number; pickup?: Point; dwell?: number }
 type Intent = { mode: string; goal?: Point; fire: "players" | "crate" | "quiet"; boost: boolean; reason: string }
 
-// Decision-time budgets in ms, well under the 50 ms answer limit on one slow CPU.
-const PLAN_SOFT_MS = 5
-const PLAN_HARD_MS = 8
+// Decision-time safety limits in ms. main.ts already answers within 33 ms from a worker
+// thread; these only stop rare 100+ ms decisions from leaving the worker several
+// observations behind. Tighter limits cut planning short and cost zone deaths in the sim.
+const PLAN_SOFT_MS = 25
+const PLAN_HARD_MS = 40
 // No single route search runs past this point of the decision.
-const PLAN_SEARCH_MS = 10
+const PLAN_SEARCH_MS = 45
 
 export function makeBot(hello: any, map: GameMap, rng: () => number = Math.random, profileSpec?: string | Partial<Profile>) {
   const P = resolveProfile(profileSpec)
@@ -41,7 +43,8 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
   const me_id = hello.slot
   const env = typeof process !== "undefined" ? process.env : {}
   const forcedPractice = hello.practice === true || env.MR_FORCE_SQUAD === "1" || (globalThis as any).MR_FORCE_SQUAD === true
-  let practice = forcedPractice
+  // A duelling profile plays every lobby the way it plays the practice squad.
+  let practice = forcedPractice || P.duel
   // The play client prints `alive / config.match.mechs`, so `alive` counts this mech too.
   const aliveIncludesSelf = hello.alive_includes_self ?? env.MR_ALIVE_INCLUDES_SELF !== "0"
   const lobbySize: number = cfg.match?.mechs ?? 16
@@ -528,7 +531,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     }
     // Practice lobbies seat house bots that never kill each other: if well into the match
     // every missing mech was our own kill, behave like the practice profile.
-    if (!forcedPractice) practice = t > 120 && sawMech && Number.isFinite(obs.alive)
+    if (!forcedPractice && !P.duel) practice = t > 120 && sawMech && Number.isFinite(obs.alive)
       && obs.alive + myKills >= lobbySize - (aliveIncludesSelf ? 0 : 1)
     for (const [id, tt] of attackers) if (t - tt > 4) attackers.delete(id)
     for (const [id, tt] of takeFail) if (t - tt > 4) takeFail.delete(id)
@@ -584,7 +587,11 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       && visible.length <= 2 && tDist <= 120
     const fight = canEngage && (duel || cramped || (engaged && watchers.length <= 1 && favorable)
       || (practice && watchers.length <= 1 && hpFrac > 0.55 && tDist < 120)
-      || (elective && watchers.length <= 1) || (endgame && hpFrac > 0.3) || weakPrey)
+      || (elective && watchers.length <= 1) || (endgame && hpFrac > 0.3) || weakPrey
+      // Duel rules: answer an attack unless badly outnumbered or outgunned, and open fire on a
+      // rival in range when healthy and at most one mech is looking at us.
+      || (P.duel && engaged && watchers.length <= 2 && (hpFrac > 0.4 || target!.hp < self.hp * 1.1 || tDist < 25))
+      || (P.duel && watchers.length <= 1 && hpFrac > 0.5 && tDist < 160))
 
     // ---- strategic intent and movement ----
     let move: Point = [0, 0]
