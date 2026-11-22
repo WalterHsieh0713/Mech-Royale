@@ -1,4 +1,6 @@
 import assert from "node:assert/strict"
+// Decisions must not depend on machine speed in tests.
+process.env.MR_PLAN_BUDGET = "off"
 import { test } from "node:test"
 import { leaveBy, routeTiming } from "../strategy.ts"
 import type { Point, Zone } from "../strategy.ts"

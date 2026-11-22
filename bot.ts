@@ -29,6 +29,12 @@ type Track = { id: number; pos: V3; vel: V3; seen: number; hpSeen: number; damag
 type Objective = { kind: "loot" | "cube" | "drop" | "crate" | "npc"; id: number; point: Point; value: number; pickup?: Point; dwell?: number }
 type Intent = { mode: string; goal?: Point; fire: "players" | "crate" | "quiet"; boost: boolean; reason: string }
 
+// Decision-time budgets in ms, well under the 50 ms answer limit on one slow CPU.
+const PLAN_SOFT_MS = 5
+const PLAN_HARD_MS = 8
+// No single route search runs past this point of the decision.
+const PLAN_SEARCH_MS = 10
+
 export function makeBot(hello: any, map: GameMap, rng: () => number = Math.random, profileSpec?: string | Partial<Profile>) {
   const P = resolveProfile(profileSpec)
   const cfg = hello.config
@@ -123,10 +129,22 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     return previous.score - next.score > 1e-6
   }
 
+  // Route searches are most of the decision time. Each observation gets a budget: past the
+  // soft limit the optional fastest-route comparison is skipped, past the hard limit new
+  // searches are refused (callers keep their current path or step straight at the goal).
+  let actStart = 0
+  const spentMs = () => performance.now() - actStart
+  // Tests and reproducible simulations turn the budget off (MR_PLAN_BUDGET=off): with it on,
+  // decisions depend on how fast the machine is.
+  const budgeted = env.MR_PLAN_BUDGET !== "off" && (globalThis as any).MR_PLAN_BUDGET !== "off"
+  const overBudget = () => budgeted && spentMs() > PLAN_HARD_MS
+
   function navigate(from: Point, goal: Point, zone: Zone, speed: number, emergency = false, compareFast = false): RoutePlan {
-    const covered = map.planPath(...from, ...goal, emergency ? 14000 : 5500, navigationCost)
-    if (!compareFast) return covered
-    const fastest = map.planPath(...from, ...goal, emergency ? 14000 : 5500)
+    if (overBudget()) return { points: [], status: "unreachable" }
+    const deadline = budgeted ? actStart + PLAN_SEARCH_MS : Infinity
+    const covered = map.planPath(...from, ...goal, emergency ? 14000 : 5500, navigationCost, deadline)
+    if (!compareFast || (budgeted && spentMs() > PLAN_SOFT_MS)) return covered
+    const fastest = map.planPath(...from, ...goal, emergency ? 14000 : 5500, undefined, deadline)
     if (covered.status !== "reached" && fastest.status !== "reached") {
       const remaining = (route: RoutePlan) => d2(route.points.at(-1) ?? from, goal)
       return remaining(fastest) < remaining(covered) ? fastest : covered
@@ -141,7 +159,11 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     const stale = t - pathT >= 2 || (pathRevision !== beliefs.revision && t - pathT >= 0.7)
     const earlyRotation = purpose === "tohide" && zoneMargin(zone, from, Math.max(t, zone.shrink_end)) < rotationMargin(zone)
     const compareFast = emergency || purpose === "zone" || earlyRotation
-    if (changed || stale) {
+    if ((changed || stale) && overBudget() && (path.length || !changed)) {
+      // Out of time this observation: keep following the old route and replan next time.
+    } else if ((changed || stale) && overBudget()) {
+      return openStep(from, goal)
+    } else if (changed || stale) {
       const route = navigate(from, goal, zone, speed, emergency, compareFast)
       // Long trips across the campus exceed the search budget; a partial route still makes
       // progress toward cover or the circle. Optional loot trips need a complete route.
@@ -154,7 +176,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       pathPurpose = purpose
       pathZone = zoneKey
     }
-    const canSkipWaypoint = () => map.canShortcut(...from, path.slice(0, 2), navigationCost)
+    const canSkipWaypoint = () => !overBudget() && map.canShortcut(...from, path.slice(0, 2), navigationCost)
       && (!compareFast || !betterRotationRoute(from, zone, speed, path, path.slice(1)))
     const isLanding = (p?: Point) => !!p && pathDrops.some((q) => q[0] === p[0] && q[1] === p[1])
     // Reaching a ledge takeoff always moves on to the hop; the landing is never "walkable".
@@ -412,6 +434,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
   }
 
   function act(obs: any): any {
+    actStart = performance.now()
     t = obs.t
     const self = obs.self
     const [x, y, z] = self.pos

@@ -426,7 +426,7 @@ export class GameMap {
   }
 
   /** A* with bounded extra cost per meter of exposure and a checked route to the exact goal. */
-  planPath(sx: number, sy: number, gx: number, gy: number, maxExpand = 60000, extraCost?: RiskAt): RoutePlan {
+  planPath(sx: number, sy: number, gx: number, gy: number, maxExpand = 60000, extraCost?: RiskAt, deadline = Infinity): RoutePlan {
     const unreachable: RoutePlan = { points: [], status: "unreachable" }
     const N = this.cnx * this.cny
     if (!N || !this.inGrid(sx, sy) || !Number.isFinite(gx) || !Number.isFinite(gy)) return unreachable
@@ -499,6 +499,8 @@ export class GameMap {
       const hc = H(cur)
       if (hc < bestH) { bestH = hc; bestNode = cur }
       if (++expanded > maxExpand) break
+      // Out of decision time: stop and return the partial route to the closest node so far.
+      if ((expanded & 31) === 0 && performance.now() > deadline) break
       this.closed[cur] = st
       const ci = cur % cnx, cj = (cur / cnx) | 0
       const gc = this.gScore[cur]
@@ -559,7 +561,8 @@ export class GameMap {
       let last = fromStart ? i : Math.min(pts.length - 1, i + 40)
       for (let k = i + 1; k <= last; k++) if (landing[k]) { last = k - 1; break }
       let j = last
-      if (extraCost && !fromStart) {
+      // Past the deadline, smooth by walkability alone instead of re-checking exposure.
+      if (extraCost && !fromStart && !(deadline < Infinity && performance.now() > deadline)) {
         const original: RouteRisk[] = []
         let px = ax, py = ay
         for (let k = i; k <= last; k++) {
