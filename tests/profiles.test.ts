@@ -118,3 +118,23 @@ test("after a kill, the duel profile walks to the dropped cubes where the rival 
   for (let k = 1; k <= 3; k++) action = bot.act(observation({ t: 10.2 + k * 0.1, tick: 612 + 2 * k, cubes: after.cubes }))
   assert.ok(action.move[0] > 0.5, `expected to head east to the cubes, got ${action.move}`)
 })
+
+test("an engaged duellist returns fire while it breaks away; survivor holds fire at range", () => {
+  const hit = () => {
+    const o = passingMech()
+    o.mechs[0].pos = [90, 0, 0]
+    o.mechs[0].aim = [Math.PI, 0]
+    o.self.hp = 500
+    o.self.aim = [0, Math.atan2(4.5 - 7, 90)]
+    o.events = [{ type: "damaged", by: 2, amount: 45, weapon: "gun", bearing: 0 }]
+    return o
+  }
+  const duel = fixtureBot("duel")
+  duel.act(hit())
+  const later = hit(); later.t += 1.5; later.tick += 90; later.events = []
+  assert.equal(duel.act(later).fire[0], true)
+  const survivor = fixtureBot("survivor")
+  survivor.act(hit())
+  const later2 = hit(); later2.t += 1.5; later2.tick += 90; later2.events = []
+  assert.equal(survivor.act(later2).fire[0], false)
+})

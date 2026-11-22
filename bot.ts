@@ -680,7 +680,9 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       intent = { mode: "third-party", fire: "players", boost: false, reason: "short-burst" }
       target = thirdTarget
     } else if (engaged && !fight) {
-      intent = { mode: "evade", goal: cover ?? undefined, fire: canEngage && (tDist < 32 || t - lastDamageT < 0.8) ? "players" : "quiet",
+      // Duellists return fire the whole time they are engaged, as Josh's bot does; the
+      // hiding profiles only answer at close range or right after a hit.
+      intent = { mode: "evade", goal: cover ?? undefined, fire: canEngage && (P.duel || tDist < 32 || t - lastDamageT < 0.8) ? "players" : "quiet",
         boost: self.energy > 16, reason: "break-sight" }
     } else if (target && fight) {
       intent = { mode: "fight", fire: "players", boost: self.energy > reserve && !chargeHeld,
