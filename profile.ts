@@ -85,9 +85,16 @@ export const PROFILES: Record<string, Profile> = {
     ...base, name: "duel", duel: true, cubeValue: 1.5, lootRange: 110, farmNpcs: true, farmCrates: "always",
     farmUntilRadius: 60, drops: true, endgameHunt: 3,
   },
+  // Duel rules plus going after the freshest contact instead of waiting to be found: in
+  // practice only one weak house bot hunts early, so meet the squad one at a time while
+  // healthy and bank their cubes before the late swarm.
+  hunter: {
+    ...base, name: "hunter", duel: true, engage: "hunt", engageRange: 170, cubeValue: 1.5, lootRange: 110,
+    farmNpcs: true, farmCrates: "always", farmUntilRadius: 60, drops: true, endgameHunt: 16,
+  },
 }
 
-export const DEFAULT_PROFILE = "duel"
+export const DEFAULT_PROFILE = "hunter"
 
 export function resolveProfile(spec?: string | Partial<Profile>): Profile {
   if (spec && typeof spec === "object") return { ...PROFILES[spec.name ?? DEFAULT_PROFILE] ?? base, ...spec }
