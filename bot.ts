@@ -5,6 +5,8 @@ import { ContactBeliefs } from "./belief.ts"
 import { leaveBy, rotationEntries, rotationEntry, rotationMargin, rotationPressure, routeTiming, zoneMargin } from "./strategy.ts"
 import type { Point, Zone } from "./strategy.ts"
 import { distractedTarget, thirdPartyExit } from "./third-party.ts"
+import { resolveProfile } from "./profile.ts"
+import type { Profile } from "./profile.ts"
 
 type V3 = [number, number, number]
 const TAU = Math.PI * 2
@@ -24,14 +26,21 @@ const UPGRADE_PRI = [
 const WEAPON_PRI: Record<string, number> = { laser: 3, lightning: 2, mortar: 1, gun: 0 }
 
 type Track = { id: number; pos: V3; vel: V3; seen: number; hpSeen: number; damagedAt: number; hp: number; maxhp: number; cubes: number; weapons: string[]; charging: boolean; aim: [number, number]; visible: boolean }
-type Objective = { kind: "loot" | "cube" | "drop" | "crate"; id: number; point: Point; value: number; pickup?: Point; dwell?: number }
+type Objective = { kind: "loot" | "cube" | "drop" | "crate" | "npc"; id: number; point: Point; value: number; pickup?: Point; dwell?: number }
 type Intent = { mode: string; goal?: Point; fire: "players" | "crate" | "quiet"; boost: boolean; reason: string }
 
-export function makeBot(hello: any, map: GameMap, rng: () => number = Math.random) {
+export function makeBot(hello: any, map: GameMap, rng: () => number = Math.random, profileSpec?: string | Partial<Profile>) {
+  const P = resolveProfile(profileSpec)
   const cfg = hello.config
   const me_id = hello.slot
-  const practice = hello.practice === true || process.env.MR_FORCE_SQUAD === "1" || (globalThis as any).MR_FORCE_SQUAD === true
-  const aliveIncludesSelf = hello.alive_includes_self === true || process.env.MR_ALIVE_INCLUDES_SELF === "1"
+  const env = typeof process !== "undefined" ? process.env : {}
+  const forcedPractice = hello.practice === true || env.MR_FORCE_SQUAD === "1" || (globalThis as any).MR_FORCE_SQUAD === true
+  let practice = forcedPractice
+  // The play client prints `alive / config.match.mechs`, so `alive` counts this mech too.
+  const aliveIncludesSelf = hello.alive_includes_self ?? env.MR_ALIVE_INCLUDES_SELF !== "0"
+  const lobbySize: number = cfg.match?.mechs ?? 16
+  let myKills = 0
+  let sawMech = false
   const beliefs = new ContactBeliefs(map)
   let t = 0
   const tracks = new Map<number, Track>()
@@ -47,6 +56,8 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     burst = null
   }
   let path: Point[] = []
+  let pathDrops: Point[] = []
+  let hopping = false
   let pathGoal: Point | null = null
   let pathT = -99
   let pathRevision = -1
@@ -78,6 +89,15 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
   let lastMoveT = -99
   let lastMovePos: Point | null = null
   const pickMem = new Map<number, { id: number; kind: string; pos: number[] }>()
+  // Cubes are the map's collectibles: each one grows the mech and feeds upgrade offers.
+  const cubeMem = new Map<number, number[]>()
+  const crateMem = new Map<number, number[]>()
+  const npcs = new Map<number, { pos: V3; vel: V3; hp: number; seen: number }>()
+  let npcAttackT = -99
+  let npcAttacker = -1
+  let frozenSince = -1
+  let progress: { goal: Point; best: number; since: number } | null = null
+  let lastCombatCue: { origin: Point; bearing: number; dist: string; t: number } | null = null
   const posHist: [number, number, number, number][] = []
   const stuckEvents: number[] = []
   let unstickJet = false
@@ -123,7 +143,11 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     const compareFast = emergency || purpose === "zone" || earlyRotation
     if (changed || stale) {
       const route = navigate(from, goal, zone, speed, emergency, compareFast)
-      path = route.status === "reached" || emergency ? route.points : []
+      // Long trips across the campus exceed the search budget; a partial route still makes
+      // progress toward cover or the circle. Optional loot trips need a complete route.
+      const partialOk = emergency || purpose === "tohide" || purpose === "stalk" || purpose === "hunt"
+      path = route.status === "reached" || (partialOk && route.status === "partial") ? route.points : []
+      pathDrops = route.drops ?? []
       pathGoal = goal
       pathT = t
       pathRevision = beliefs.revision
@@ -132,13 +156,60 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     }
     const canSkipWaypoint = () => map.canShortcut(...from, path.slice(0, 2), navigationCost)
       && (!compareFast || !betterRotationRoute(from, zone, speed, path, path.slice(1)))
+    const isLanding = (p?: Point) => !!p && pathDrops.some((q) => q[0] === p[0] && q[1] === p[1])
+    // Reaching a ledge takeoff always moves on to the hop; the landing is never "walkable".
     while (path.length && d2(path[0], from) < (path.length === 1 ? 1.2 : 1.6)
-      && (path.length === 1 || canSkipWaypoint())) path.shift()
-    if (path.length >= 2 && canSkipWaypoint()) path.shift()
+      && (path.length === 1 || isLanding(path[1]) || canSkipWaypoint())) path.shift()
+    if (path.length >= 2 && !isLanding(path[1]) && canSkipWaypoint()) path.shift()
     const next = path[0]
-    if (!next || !map.walkLine(...from, ...next)) return [0, 0]
-    const length = d2(next, from)
-    return [(next[0] - from[0]) / (length || 1), (next[1] - from[1]) / (length || 1)]
+    const clearance = Math.min(2.8, Math.max(1, map.clearAt(...from) - 0.05))
+    // A ledge hop is planned: walk straight off the edge toward its landing.
+    const hop = isLanding(next) && d2(next, from) < 26
+    hopping = hop
+    if (next && (hop || map.walkLine(...from, ...next, clearance))) {
+      const length = d2(next, from)
+      return [(next[0] - from[0]) / (length || 1), (next[1] - from[1]) / (length || 1)]
+    }
+    return openStep(from, goal)
+  }
+
+  // No checked waypoint: take the open direction that best approaches the goal, rather
+  // than standing still (which once left a mech motionless in the storm for 40 seconds).
+  function openStep(from: Point, goal: Point): Point {
+    if (d2(from, goal) < 1) return [0, 0]
+    const want = Math.atan2(goal[1] - from[1], goal[0] - from[0])
+    const here = map.clearAt(...from)
+    let best: Point = [0, 0], bestScore = -Infinity
+    for (let i = 0; i < 16; i++) {
+      const angle = want + (i % 2 ? 1 : -1) * Math.ceil(i / 2) * TAU / 16
+      const dx = Math.cos(angle), dy = Math.sin(angle)
+      if (!map.walkLine(...from, from[0] + dx * 4, from[1] + dy * 4, Math.min(1.2, here))) continue
+      const score = Math.cos(angle - want) + 0.15 * Math.min(4, map.clearAt(from[0] + dx * 4, from[1] + dy * 4) - here)
+      if (score > bestScore) { best = [dx, dy]; bestScore = score }
+    }
+    return bestScore > -Infinity ? best : dropStep(from, want) ?? best
+  }
+
+  // The navigation model treats every ledge as a wall, which can strand a mech on high
+  // ground such as the stadium rim. The world rules only limit stepping up, so as a last
+  // resort walk off a ledge toward the goal onto open ground below.
+  function dropStep(from: Point, want: number): Point | null {
+    const floor = map.floorAt(...from)
+    let best: Point | null = null, bestScore = -Infinity
+    for (let i = 0; i < 24; i++) {
+      const angle = want + (i % 2 ? 1 : -1) * Math.ceil(i / 2) * TAU / 24
+      const dx = Math.cos(angle), dy = Math.sin(angle)
+      let landing = -1
+      for (let r = 1; r <= 9; r++) {
+        const k = map.idx(from[0] + dx * r, from[1] + dy * r)
+        if (map.blocked[k] === 1 || map.floor[k] > floor + 0.4) break
+        if (map.floor[k] < floor - 2 && map.clearAt(from[0] + dx * (r + 2), from[1] + dy * (r + 2)) >= 2.8) { landing = r; break }
+      }
+      if (landing < 0) continue
+      const score = Math.cos(angle - want) - landing * 0.05
+      if (score > bestScore) { best = [dx, dy]; bestScore = score }
+    }
+    return best
   }
 
   function escapeWall(x: number, y: number): Point {
@@ -262,9 +333,13 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         const dx = point[0] - from[0], dy = point[1] - from[1]
         for (const fraction of [0.3, 0.55, 0.8]) approach += threatAt(from[0] + fraction * dx, from[1] + fraction * dy) / 3
       }
+      // Early rotators claim deep positions; edge players keep the storm at their back so
+      // threats can only arrive from the inside.
+      const depth = clamp(zoneMargin(zone, point, end) / Math.max(10, zone.next_radius), 0, 1)
+      const style = P.rotation === "early" ? -14 * depth : P.rotation === "edge" ? 14 * depth : 0
       const score = 42 * exposed + 55 * risk + 22 * map.expoAt(...point)
         + (urgent ? 0.28 : 0.20) * distance - 2 * Math.min(2, exits)
-        - (cover && d2(cover, point) < 1 ? 3 : 0)
+        - (cover && d2(cover, point) < 1 ? 3 : 0) + style
       const shortlist = score + (rotating ? 16 * rotationPressure(zone, point) + 16 * approach : 0)
       return { point, score, shortlist }
     }).sort((a, b) => a.shortlist - b.shortlist)
@@ -355,7 +430,12 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     // ---- memory ----
     for (const tr of tracks.values()) tr.visible = false
     for (const m of obs.mechs) {
+      if (m.kind === "npc") {
+        npcs.set(m.id, { pos: m.pos, vel: m.vel ?? [0, 0, 0], hp: m.hp ?? 1, seen: t })
+        continue
+      }
       if (m.kind !== "mech") continue
+      sawMech = true
       let tr = tracks.get(m.id)
       if (!tr) { tr = { id: m.id, hpSeen: -Infinity, damagedAt: -Infinity } as Track; tracks.set(m.id, tr) }
       if (Number.isFinite(m.hp)) {
@@ -376,10 +456,42 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       if (d2(pm.pos, position) < cfg.loot.pickup_radius && !visiblePickupIds.has(id)
         && Math.abs(pm.pos[2] - z) < 3.8) pickMem.delete(id)
     }
+    const eyeZ = z + cfg.mech.height * (1 + cfg.cubes.size_per_cube * (self.cubes ?? 0)) - 1
+    // Forget remembered items that should be in plain view but are not reported.
+    const forget = (memory: Map<number, number[]>, seenIds: Set<number>, lift: number) => {
+      for (const [id, pos] of memory) {
+        if (seenIds.has(id)) continue
+        const distance = d2(pos, position)
+        if (distance < 6 || (distance < 60 && map.see(x, y, eyeZ, pos[0], pos[1], pos[2] + lift))) memory.delete(id)
+      }
+    }
+    for (const cube of obs.cubes ?? []) cubeMem.set(cube.id, cube.pos)
+    forget(cubeMem, new Set((obs.cubes ?? []).map((c: any) => c.id)), 1)
+    for (const crate of obs.crates ?? []) crateMem.set(crate.id, crate.pos)
+    forget(crateMem, new Set((obs.crates ?? []).map((c: any) => c.id)), cfg.crates.height * 0.5)
+    for (const [id, npc] of npcs) {
+      if (npc.seen === t) continue
+      if (t - npc.seen > 25 || (d2(npc.pos, position) < 50 && map.see(x, y, eyeZ, npc.pos[0], npc.pos[1], npc.pos[2] + 2))) npcs.delete(id)
+    }
+    for (const sound of obs.sounds ?? []) {
+      if (!["gun", "laser", "lightning", "mortar"].includes(sound.kind) || typeof sound.bearing !== "number") continue
+      // Gunfire from a bearing with only NPCs in view is most likely NPC farming, not a fight.
+      const npcExplains = [...npcs.values()].some((npc) => npc.seen === t
+        && Math.abs(wrap(Math.atan2(npc.pos[1] - y, npc.pos[0] - x) - sound.bearing)) < 0.25)
+      if (!npcExplains) lastCombatCue = { origin: position, bearing: sound.bearing, dist: sound.dist ?? "mid", t }
+    }
 
     const visible = [...tracks.values()].filter((track) => track.visible)
     const damageCues = []
     for (const e of obs.events) {
+      if (e.type === "kill" && typeof e.target === "number" && e.target < 100) myKills++
+      // A healthy mech answers NPCs; a hurt one treats them as any other attacker and leaves.
+      if (e.type === "damaged" && typeof e.by === "number" && npcs.has(e.by) && self.hp > self.max_hp * 0.5) {
+        // NPCs only defend their patch; answer them without treating it as a player fight.
+        npcAttackT = t
+        npcAttacker = e.by
+        continue
+      }
       if (e.type === "damaged") {
         lastDamageT = t
         if (typeof e.by === "number" && tracks.has(e.by)) attackers.set(e.by, t)
@@ -391,6 +503,10 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         if (!visiblePickupIds.has(e.id)) pickMem.delete(e.id)
       }
     }
+    // Practice lobbies seat house bots that never kill each other: if well into the match
+    // every missing mech was our own kill, behave like the practice profile.
+    if (!forcedPractice) practice = t > 120 && sawMech && Number.isFinite(obs.alive)
+      && obs.alive + myKills >= lobbySize - (aliveIncludesSelf ? 0 : 1)
     for (const [id, tt] of attackers) if (t - tt > 4) attackers.delete(id)
     for (const [id, tt] of takeFail) if (t - tt > 4) takeFail.delete(id)
     for (const [id, tt] of farmCooldowns) if (t >= tt) farmCooldowns.delete(id)
@@ -434,8 +550,18 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     const duel = aliveIncludesSelf && obs.alive === 2 && visible.length <= 1
     const cramped = visible.length === 1 && zone.next_radius <= 26 && zoneMargin(zone, position, t + 5) > 0 && tDist <= 55
     const favorable = !!target && (hpFrac > 0.48 || target.hp < self.hp * 0.65 || tDist < 23) && target.hp < self.hp * 1.6
+    // Mechs alive including this one.
+    const aliveNow = Number.isFinite(obs.alive) ? obs.alive + (aliveIncludesSelf ? 0 : 1) : lobbySize
+    const endgame = P.endgameHunt > 0 && aliveNow <= P.endgameHunt
+    const elective = P.engage === "hunt" ? hpFrac > 0.35 && visible.length <= 2 && tDist <= P.engageRange
+      : P.engage === "favorable" ? favorable && hpFrac > 0.55 && visible.length === 1 && tDist <= P.engageRange
+      : false
+    // A vulture finishes a mech that someone else has already broken.
+    const weakPrey = P.thirdParty === "vulture" && !!target && target.hp < target.maxhp * 0.45 && hpFrac > 0.5
+      && visible.length <= 2 && tDist <= 120
     const fight = canEngage && (duel || cramped || (engaged && watchers.length <= 1 && favorable)
-      || (practice && watchers.length <= 1 && hpFrac > 0.55 && tDist < 120))
+      || (practice && watchers.length <= 1 && hpFrac > 0.55 && tDist < 120)
+      || (elective && watchers.length <= 1) || (endgame && hpFrac > 0.3) || weakPrey)
 
     // ---- strategic intent and movement ----
     let move: Point = [0, 0]
@@ -493,6 +619,21 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       move = [(point[0] - x) / distance, (point[1] - y) / distance]
     }
 
+    // Hunters chase the freshest contact; vultures walk toward a fight they can hear and stop
+    // short of it, where the third-party check can take over once both sides are visible.
+    let huntGoal: Point | null = null
+    let huntMode = "hunt"
+    if (!urgent && hpFrac > 0.45 && visible.length === 0 && (endgame || P.engage === "hunt")) {
+      const lead = beliefs.strongest(x, y)
+      if (lead && lead.age < (endgame ? 30 : 10) && zoneMargin(zone, [lead.pos[0], lead.pos[1]], t + 10) > margin) huntGoal = [lead.pos[0], lead.pos[1]]
+    }
+    if (!huntGoal && P.thirdParty === "vulture" && lastCombatCue && t - lastCombatCue.t < 6 && !urgent && hpFrac > 0.6
+      && visible.length === 0 && t - lastDamageT > 5 && currentSlack > rotationBudget + 6) {
+      const estimate = ({ near: 35, mid: 95, far: 170 } as Record<string, number>)[lastCombatCue.dist] ?? 95
+      const stand = estimate - 50
+      const goal: Point = [lastCombatCue.origin[0] + Math.cos(lastCombatCue.bearing) * stand, lastCombatCue.origin[1] + Math.sin(lastCombatCue.bearing) * stand]
+      if (stand > 8 && map.clearAt(...goal) >= 2.8 && zoneMargin(zone, goal, t + 15) > margin) { huntGoal = goal; huntMode = "stalk" }
+    }
     if (urgent) {
       intent = { mode: "zone", goal: cover ?? zone.next_center, fire: engaged && canEngage ? "players" : "quiet",
         boost: self.energy > (outside ? 14 : reserve), reason: outside ? "outside" : "deadline" }
@@ -506,7 +647,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         boost: self.energy > 16, reason: "break-sight" }
     } else if (target && fight) {
       intent = { mode: "fight", fire: "players", boost: self.energy > reserve && !chargeHeld,
-        reason: duel || cramped ? "endgame" : "defend" }
+        reason: duel || cramped || endgame ? "endgame" : weakPrey ? "finish" : elective ? "elective" : "defend" }
       const dd = tDist
       const ux = (target.pos[0] - x) / (dd || 1), uy = (target.pos[1] - y) / (dd || 1)
       if (t > strafeFlipT) { strafeDir = rng() < 0.5 ? -strafeDir : strafeDir; strafeFlipT = t + 0.45 + rng() * 0.9 }
@@ -531,6 +672,8 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         move = safeStep(alternate) ? alternate : [0, 0]
       }
       if (!engaged && localRisk < 0.25 && map.expoAt(x, y) < 0.4 && dd <= prefMax) move = [0, 0]
+    } else if (!target && huntGoal && d2(huntGoal, position) > 4) {
+      intent = { mode: huntMode, goal: huntGoal, fire: "quiet", boost: false, reason: endgame ? "endgame" : huntMode === "stalk" ? "gunfire" : "contact" }
     } else if (duel && target && firingRange > 0 && tDist <= firingRange + 24 && hpFrac > 0.3) {
       if (t - peekT >= 1.5 || (peekTarget && d2(peekTarget, target.pos) > 9)) {
         peek = chooseFiringAngle(position, zone, speed, margin, target, firingRange, mz - z)
@@ -544,6 +687,11 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     } else {
       const candidates: Objective[] = []
       const late = duel || zone.next_radius <= 45
+      const farmPhase = !duel && zone.next_radius > P.farmUntilRadius
+      const reach = late ? 30 : P.lootRange
+      const finalCircle = Math.max(t, zone.shrink_end)
+      // Early rotators only take what lies inside the next circle.
+      const allowed = (point: Point) => P.rotation !== "early" || zoneMargin(zone, point, finalCircle) >= margin
       const weaponValue = (kind: string) => (WEAPON_PRI[kind] ?? -1)
         + (kind === "lightning" && late && self.energy > reserve ? 1.25 : 0)
         - (kind === "mortar" && late ? 1.5 : 0)
@@ -553,26 +701,44 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         const improvement = weaponValue(pickup.kind) - (extra ? weaponValue(extra.kind) : -1)
         if (improvement <= 0 || Math.abs(pickup.pos[2] - z) >= 4) continue
         const point: Point = [pickup.pos[0], pickup.pos[1]]
-        candidates.push({ kind: "loot", id: pickup.id, point, value: (extra ? 5 : 18) + improvement * 5 })
+        if (allowed(point)) candidates.push({ kind: "loot", id: pickup.id, point, value: (extra ? 5 : 18) + improvement * 5 })
       }
-      for (const cube of obs.cubes) {
-        if (Math.abs(cube.pos[2] - z) >= 4) continue
-        candidates.push({ kind: "cube", id: cube.id, point: [cube.pos[0], cube.pos[1]], value: late ? 9 : 18 })
+      // Cubes: remembered as well as visible, worth more where several lie together.
+      for (const [id, pos] of cubeMem) {
+        if (Math.abs(pos[2] - z) >= 4 || d2(pos, position) > reach) continue
+        let cluster = 0
+        for (const [other, q] of cubeMem) if (other !== id && d2(q, pos) < 12) cluster++
+        const point: Point = [pos[0], pos[1]]
+        if (allowed(point)) candidates.push({ kind: "cube", id, point, value: (late ? 10 : 16) * P.cubeValue * (1 + 0.45 * Math.min(4, cluster)) })
       }
-      for (const drop of obs.drops ?? []) {
+      if (P.drops) for (const drop of obs.drops ?? []) {
         if ((drop.holder != null && drop.holder !== me_id) || drop.lands_in > 0.5) continue
-        candidates.push({ kind: "drop", id: drop.id, point: [drop.pos[0], drop.pos[1]], value: late ? 12 : 22, dwell: 2 })
+        candidates.push({ kind: "drop", id: drop.id, point: [drop.pos[0], drop.pos[1]], value: (late ? 12 : 22) * Math.max(1, P.cubeValue * 0.8), dwell: 3 })
       }
-      // The crate action is deliberate, limited to a short, quiet farm with a need for gear.
+      // Farming makes noise, so it needs a quiet neighbourhood and a usable gun.
       const gun = gunS >= 0 ? W[gunS] : null
-      if (!extra && gun && !late && hpFrac > 0.65 && (gun.ammo ?? 0) >= 3
-        && t - lastDamageT > 5 && visible.length === 0 && localRisk < 0.15) {
-        for (const crate of obs.crates) {
-          if ((farmCooldowns.get(crate.id) ?? -Infinity) > t) continue
-          if (d2(crate.pos, position) > Math.min(24, gun.stats.range) || Math.abs(crate.pos[2] - z) > 4) continue
-          const cz = crate.pos[2] + cfg.crates.height * 0.5
-          if (!map.los(x, y, mz, crate.pos[0], crate.pos[1], cz)) continue
-          candidates.push({ kind: "crate", id: crate.id, point: position, pickup: [crate.pos[0], crate.pos[1]], value: 23, dwell: 3 })
+      const quiet = t - lastDamageT > 5 && visible.length === 0 && localRisk < (P.farmNpcs ? 0.2 : 0.15)
+      const rounds = gun ? (gun.reload > 0 ? gun.stats.mag : gun.ammo ?? 0) : 0
+      const shotFrom = (pos: number[], lift: number, range: number) => d2(pos, position) <= range
+        && map.los(x, y, mz, pos[0], pos[1], pos[2] + lift)
+      if (gun && quiet && farmPhase && hpFrac > 0.7 && rounds >= 3 && P.farmNpcs) {
+        for (const [id, npc] of npcs) {
+          if ((farmCooldowns.get(id) ?? -Infinity) > t || d2(npc.pos, position) > reach || Math.abs(npc.pos[2] - z) > 6) continue
+          const inShot = npc.seen === t && shotFrom(npc.pos, cfg.npc.height * 0.5, Math.min(60, gun.stats.range * 0.6))
+          const point: Point = inShot ? position : [npc.pos[0], npc.pos[1]]
+          if (allowed([npc.pos[0], npc.pos[1]])) candidates.push({ kind: "npc", id, point, pickup: [npc.pos[0], npc.pos[1]], value: 28 * P.cubeValue, dwell: 4 })
+        }
+      }
+      const needy = !extra
+      if (gun && quiet && !late && hpFrac > 0.6 && rounds >= 3 && (P.farmCrates === "always" || (P.farmCrates === "needy" && needy))) {
+        for (const [id, pos] of crateMem) {
+          if ((farmCooldowns.get(id) ?? -Infinity) > t || Math.abs(pos[2] - z) > 4) continue
+          const limit = P.farmCrates === "always" ? reach : Math.min(24, gun.stats.range)
+          if (d2(pos, position) > limit) continue
+          const inShot = shotFrom(pos, cfg.crates.height * 0.5, Math.min(35, gun.stats.range))
+          if (!inShot && P.farmCrates !== "always") continue
+          const point: Point = inShot ? position : [pos[0], pos[1]]
+          if (allowed([pos[0], pos[1]])) candidates.push({ kind: "crate", id, point, pickup: [pos[0], pos[1]], value: needy ? 23 : 10 * P.cubeValue, dwell: 3 })
         }
       }
       const previous = objective
@@ -585,25 +751,28 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         objectiveRevision = beliefs.revision
         objectiveZone = zoneKey
         let best = late ? 6 : 0
-        const rank = (candidate: Objective) => candidate.value - d2(candidate.point, position) * 0.44
+        const rank = (candidate: Objective) => candidate.value - d2(candidate.point, position) * 0.25
           - (candidate.kind === "crate" ? 6 : 0)
-        for (const candidate of candidates.filter((item) => d2(item.point, position) <= (late ? 25 : 75))
-          .sort((a, b) => rank(b) - rank(a)).slice(0, 3)) {
+        for (const candidate of candidates.sort((a, b) => rank(b) - rank(a)).slice(0, 4)) {
           if (!cover || rank(candidate) <= 0) continue
-          const outward = navigate(position, candidate.point, zone, speed)
+          const outward: RoutePlan = candidate.point === position ? { status: "reached", points: [] } : navigate(position, candidate.point, zone, speed)
           if (outward.status !== "reached") continue
           const pickup = candidate.pickup ?? candidate.point
           const collect = candidate.pickup ? navigate(candidate.point, pickup, zone, speed) : null
-          if (collect && collect.status !== "reached") continue
+          if (collect && collect.status === "unreachable") continue
           const back = navigate(pickup, cover, zone, speed)
-          if (back.status !== "reached") continue
+          if (back.status === "unreachable") continue
           const outwardPoints = outward.points.length ? outward.points : [candidate.point]
           const points = [...outwardPoints, ...(collect?.points ?? []), ...back.points]
           const timing = routeTiming(zone, position, points, t, speed, outwardPoints.length - 1, candidate.dwell ?? 0.5)
           if (timing.minMargin < margin || zoneMargin(zone, cover, timing.arrival + 3) < margin) continue
+          // Price the trip out and the time spent collecting; the walk back to cover only
+          // has to be feasible within the zone deadline (checked above).
+          const outwardSeconds = map.routeRisk(...position, outwardPoints, () => 0).length / speed + (candidate.dwell ?? 0.5)
+          const backSeconds = Math.max(0, timing.arrival - t - outwardSeconds)
           const risk = map.routeRisk(...position, points, threatAt)
           const stopRisk = Math.max(threatAt(...candidate.point), threatAt(...pickup))
-          const score = candidate.value - (candidate.kind === "crate" ? 6 : 0) - (timing.arrival - t) * 1.8
+          const score = candidate.value - (candidate.kind === "crate" ? 6 : 0) - outwardSeconds * 1.2 - backSeconds * 0.35
             - 0.65 * risk.integral - 20 * Math.max(risk.peak, stopRisk) - 4 * stopRisk * (candidate.dwell ?? 1)
             + (previous?.id === candidate.id && previous.kind === candidate.kind ? 3 : 0)
           if (score > best) {
@@ -613,8 +782,9 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         }
       }
       if (objective && localRisk < 0.55 && currentSlack > 3) {
-        intent = { mode: objective.kind === "crate" ? "farm" : "collect", goal: objective.point,
-          fire: objective.kind === "crate" ? "crate" : "quiet", boost: false, reason: objective.kind }
+        const farm = objective.kind === "crate" || objective.kind === "npc"
+        intent = { mode: farm ? "farm" : "collect", goal: objective.point,
+          fire: objective.kind === "crate" ? "crate" : objective.kind === "npc" ? "npc" : "quiet", boost: false, reason: objective.kind }
         if (objective.kind === "loot" && d2(objective.point, position) <= cfg.loot.pickup_radius - 0.3
           && visiblePickupIds.has(objective.id) && canSwap) {
           act.take = objective.id
@@ -628,19 +798,26 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       objective = null
       objectiveT = -99
     }
-    if (intent.fire === "crate" && objective) {
-      if (farming?.id !== objective.id) farming = { id: objective.id, started: t }
-      if (t - farming.started >= 3) {
-        farmCooldowns.set(objective.id, t + 12)
+    // Answer an NPC that is shooting at us when no mech is in view; it is loud already.
+    if (intent.fire === "quiet" && t - npcAttackT < 3 && visible.length === 0 && intent.mode !== "zone" && npcs.has(npcAttacker)) {
+      intent.fire = "npc"
+    }
+    const farmTarget = intent.fire === "crate" || intent.fire === "npc" ? objective : null
+    if (farmTarget && (farmTarget.kind === "crate" || farmTarget.kind === "npc")) {
+      if (farming?.id !== farmTarget.id) farming = { id: farmTarget.id, started: t }
+      const limit = farmTarget.kind === "npc" ? 9 : 4
+      if (t - farming.started >= limit + d2(farmTarget.point, position) / speed) {
+        farmCooldowns.set(farmTarget.id, t + 12)
         farming = null
         objective = null
         objectiveT = -99
         intent = { mode: "hide", fire: "quiet", boost: false, reason: "farm-timeout" }
       }
-    } else {
+    } else if (intent.fire !== "npc") {
       if (farming) farmCooldowns.set(farming.id, t + 5)
       farming = null
     }
+    hopping = false
     if (intent.goal) {
       move = followGoal(position, intent.goal, intent.mode, zone, zoneKey, speed, intent.mode === "zone" || intent.mode === "evade")
       if (intent.mode === "tohide" && localRisk > 0.2 && currentSlack > 8) move = [move[0] * 0.8, move[1] * 0.8]
@@ -707,7 +884,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       intent.reason = "dodge"
       if (intent.fire === "crate") intent.fire = "quiet"
       if (act.take !== undefined) { delete act.take; delete act.drop }
-    } else if (map.clearAt(x, y) < 2.8) {
+    } else if (map.clearAt(x, y) < 2.8 && !hopping) {
       move = escapeWall(x, y)
       if (Math.hypot(...move) > 0) intent.reason = "clear-wall"
     }
@@ -718,15 +895,34 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     while (posHist.length && t - posHist[0][0] > 1.6) posHist.shift()
     const old = posHist[0]
     const allWant = posHist.every((p) => p[3] === 1)
+    // A goal that is still far away while the controller emits no movement is the same
+    // failure as pushing against a wall, and must not silently hold the mech in place.
+    const wantsGoal = !!intent.goal && d2(intent.goal, position) > 3 && wantL < 0.1 && intent.mode !== "farm"
+    if (wantsGoal && frozenSince < 0) frozenSince = t
+    else if (!wantsGoal) frozenSince = -1
+    // Moving without getting closer (circling inside a walled bowl) is also being stuck.
+    let noProgress = false
+    if (intent.goal && (intent.mode === "zone" || intent.mode === "tohide" || intent.mode === "hunt")) {
+      const distance = d2(intent.goal, position)
+      if (!progress || d2(progress.goal, intent.goal) > 8 || distance < progress.best - 3) progress = { goal: intent.goal, best: distance, since: t }
+      else if (t - progress.since > 6 && distance > 8) { noProgress = true; progress = { goal: intent.goal, best: distance, since: t } }
+    } else progress = null
+    const frozen = (frozenSince >= 0 && t - frozenSince > 1.2) || noProgress
     if (!dodge && t < unstickUntil) {
       move = unstickDir
       if (unstickJet) { jump = self.grounded; boost = self.energy > 15 } else boost = false
-    } else if (!dodge && allWant && t - old[0] > 1.4 && Math.hypot(x - old[1], y - old[2]) < 2.5) {
+    } else if (!dodge && (frozen || (allWant && t - old[0] > 1.4 && Math.hypot(x - old[1], y - old[2]) < 2.5))) {
       stuckEvents.push(t)
       while (stuckEvents.length && t - stuckEvents[0] > 12) stuckEvents.shift()
       posHist.length = 0
-      const ma = Math.atan2(move[1], move[0])
-      if ((urgent || engaged) && self.energy > 35 && stuckEvents.length % 2 === 1) {
+      frozenSince = -1
+      const ma = frozen && intent.goal ? Math.atan2(intent.goal[1] - y, intent.goal[0] - x) : Math.atan2(move[1], move[0])
+      const drop = stuckEvents.length >= 2 || frozen ? dropStep(position, ma) : null
+      if (drop) {
+        unstickJet = false
+        unstickDir = drop
+        unstickUntil = t + 1.2
+      } else if ((urgent || engaged) && self.energy > 35 && stuckEvents.length % 2 === 1) {
         // climb: jump and jet straight toward where we want to go
         unstickJet = true
         unstickDir = [Math.cos(ma), Math.sin(ma)]
@@ -748,13 +944,18 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     const fire: [boolean, boolean] = [false, false]
     // A true input holds an existing laser charge. A false input releases it.
     if (chargeHeld) fire[laserS] = true
-    let shootTarget: { pos: V3; vel: V3; cz: number; kind: "mech" | "crate"; r: number } | null = null
+    let shootTarget: { pos: V3; vel: V3; cz: number; kind: "mech" | "crate" | "npc"; r: number } | null = null
     if (target && intent.fire === "players") {
       shootTarget = { pos: target.pos, vel: target.vel, cz: mechCenterZ(target), kind: "mech",
         r: cfg.mech.radius * (1 + cfg.cubes.size_per_cube * target.cubes) }
     } else if (intent.fire === "crate") {
       const crate = obs.crates.find((c: any) => c.id === objective?.id)
       if (crate) shootTarget = { pos: crate.pos, vel: [0, 0, 0], cz: mechCenterZ(crate, "crate"), kind: "crate", r: cfg.crates.radius }
+    } else if (intent.fire === "npc") {
+      const id = objective?.kind === "npc" ? objective.id : npcAttacker
+      const npc = obs.mechs.find((m: any) => m.kind === "npc" && m.id === id)
+        ?? (t - npcAttackT < 3 ? obs.mechs.find((m: any) => m.kind === "npc" && m.id === npcAttacker) : undefined)
+      if (npc) shootTarget = { pos: npc.pos, vel: npc.vel ?? [0, 0, 0], cz: mechCenterZ(npc, "npc"), kind: "npc", r: cfg.npc.radius }
     }
 
     if (shootTarget) {
@@ -769,7 +970,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
       const los = map.los(x, y, mz, sol.pt[0], sol.pt[1], sol.pt[2], 1.5)
       const onTarget = yawErr < tol && pitErr < 2.5
       if (gunW && los && onTarget && sol.dist < gunW.stats.range * 0.98 && (gunW.ammo ?? 1) > 0) fire[gunS] = true
-      if (laserS >= 0 && shootTarget.kind === "mech" && intent.mode !== "third-party") {
+      if (laserS >= 0 && shootTarget.kind !== "crate" && intent.mode !== "third-party") {
         const lw = W[laserS]
         const ls = solveAim(self, tp, shootTarget.vel, Infinity, 0.05)
         const lerr = Math.abs(wrap(self.aim[0] - ls.yaw)) * ls.dist
@@ -784,7 +985,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
           fire[laserS] = !(lerr < shootTarget.r * 0.8 && pitchError < 2.5)
         }
       }
-      if (litS >= 0 && shootTarget.kind === "mech" && intent.mode !== "third-party") {
+      if (litS >= 0 && shootTarget.kind !== "crate" && intent.mode !== "third-party") {
         const lw = W[litS]
         const yawE = Math.abs(wrap(self.aim[0] - sol.yaw))
         if (sol.dist < lw.stats.range * 0.95 && yawE < (lw.stats.cone_deg * Math.PI) / 360 * 0.8 && self.energy > lw.stats.energy + 8 && lw.cooldown <= 0.05 && los) fire[litS] = true

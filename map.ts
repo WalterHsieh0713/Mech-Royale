@@ -3,7 +3,8 @@
 export type World = any
 type Point = [number, number]
 type RiskAt = (x: number, y: number) => number
-export type RoutePlan = { points: Point[]; status: "reached" | "partial" | "unreachable" }
+/** `drops` lists waypoints reached by walking off a ledge rather than along clear ground. */
+export type RoutePlan = { points: Point[]; status: "reached" | "partial" | "unreachable"; drops?: Point[] }
 type RouteRisk = { length: number; integral: number; peak: number }
 
 const STEP_UP = 1.2
@@ -139,7 +140,45 @@ export class GameMap {
           if (f0 - mn > 6) this.ccost[k] += 3
         }
       }
+    this.buildDrops()
     this.buildExposure()
+  }
+
+  /** One-way ledge exits: coarse cell -> landing cells on open ground at least 2.5 m below. */
+  dropFrom = new Map<number, number[]>()
+  private buildDrops() {
+    const cs = this.cs
+    for (let j = 1; j < this.cny - 1; j++)
+      for (let i = 1; i < this.cnx - 1; i++) {
+        const k = j * this.cnx + i
+        if (!this.cwalk[k]) continue
+        const x = this.minX + i * cs, y = this.minY + j * cs
+        if (this.clearAt(x, y) > 7) continue
+        const f0 = this.floorAt(x, y)
+        let lands: number[] | null = null
+        for (let d = 0; d < 8; d++) {
+          const dx = Math.cos(d * Math.PI / 4), dy = Math.sin(d * Math.PI / 4)
+          // Follow walkable steps (a rim is often a little higher than the stands behind it)
+          // until the first step down that is too tall to walk: that is the ledge.
+          let previous = f0
+          for (let r = 1; r <= 12; r++) {
+            const fk = this.idx(x + dx * r, y + dy * r)
+            if (this.blocked[fk] === 1 || this.floor[fk] > previous + STEP_UP) break
+            if (this.floor[fk] >= previous - STEP_UP) { previous = this.floor[fk]; continue }
+            // Ground right below a cliff is too close to it to be a coarse cell; land on the
+            // first open cell further out, clearly below the takeoff.
+            for (let q = r + 1; q <= r + 9; q++) {
+              const landing = this.toCell(x + dx * q, y + dy * q)
+              const [lx, ly] = this.cellXY(landing)
+              if (landing === k || !this.cwalk[landing]) continue
+              if (this.floorAt(lx, ly) < f0 - 2.5 && this.floorAt(lx, ly) < previous - 2) (lands ??= []).push(landing)
+              break
+            }
+            break
+          }
+        }
+        if (lands) this.dropFrom.set(k, lands)
+      }
   }
 
   /** Sight line (canopy attenuates: ~4 m of crown blocks). */
@@ -348,6 +387,7 @@ export class GameMap {
   private came = new Int32Array(0)
   private stamp = new Int32Array(0)
   private closed = new Int32Array(0)
+  private viaDrop = new Int32Array(0)
   private curStamp = 0
 
   toCell(x: number, y: number): number {
@@ -390,14 +430,18 @@ export class GameMap {
     const unreachable: RoutePlan = { points: [], status: "unreachable" }
     const N = this.cnx * this.cny
     if (!N || !this.inGrid(sx, sy) || !Number.isFinite(gx) || !Number.isFinite(gy)) return unreachable
-    if (this.clearAt(sx, sy) < WALK_CLEARANCE) return unreachable
+    // A mech can stand where this conservative model sees too little clearance (a slope the
+    // server's 1.5 m step allows, or a wall it was pushed against). Leave such a spot along
+    // the most open short segment instead of declaring every goal unreachable.
+    const tight = this.clearAt(sx, sy) < WALK_CLEARANCE
+    if (tight && this.clearAt(sx, sy) < 0.5) return unreachable
     if (this.gScore.length !== N) {
       this.gScore = new Float32Array(N); this.came = new Int32Array(N); this.stamp = new Int32Array(N)
-      this.closed = new Int32Array(N)
+      this.closed = new Int32Array(N); this.viaDrop = new Int32Array(N)
     }
     const s = this.nearestWalkable(this.toCell(sx, sy), 12, (cell) => {
       const [x, y] = this.cellXY(cell)
-      return this.walkLine(sx, sy, x, y)
+      return this.walkLine(sx, sy, x, y, tight ? Math.min(1, this.clearAt(sx, sy) - 0.05) : WALK_CLEARANCE)
     })
     const goalCell = this.toCell(gx, gy)
     let g = this.inGrid(gx, gy) && this.clearAt(gx, gy) >= WALK_CLEARANCE
@@ -469,10 +513,22 @@ export class GameMap {
         // A coarse edge can pass between fine cells with less clearance than either endpoint.
         if ((this.ccost[nk] > 1 || this.ccost[cur] > 1) && !this.walkLine(x, y, nx, ny)) continue
         let step = (d >= 4 ? 1.4142 : 1) * (this.ccost[nk] + this.ccost[cur]) * 0.5
-        if (extraCost) step += segmentRisk(x, y, nx, ny, extraCost).integral / this.cs
+        // One midpoint sample per 2 m edge; the smoothing pass below still compares exact
+        // integrals, so a shortcut cannot cross risk the search avoided.
+        if (extraCost) step += boundedRisk(extraCost((x + nx) / 2, (y + ny) / 2)) * (d >= 4 ? 1.4142 : 1)
         const ng = gc + step
         if (this.stamp[nk] === st && ng >= this.gScore[nk]) continue
-        this.stamp[nk] = st; this.gScore[nk] = ng; this.came[nk] = cur
+        this.stamp[nk] = st; this.gScore[nk] = ng; this.came[nk] = cur; this.viaDrop[nk] = 0
+        push(nk, ng + H(nk))
+      }
+      const drops = this.dropFrom.get(cur)
+      if (drops) for (const nk of drops) {
+        if (this.closed[nk] === st) continue
+        const [nx, ny] = this.cellXY(nk)
+        const length = Math.hypot(nx - x, ny - y) / this.cs
+        const ng = gc + length * 1.5 + 2 + (extraCost ? boundedRisk(extraCost(nx, ny)) * length : 0)
+        if (this.stamp[nk] === st && ng >= this.gScore[nk]) continue
+        this.stamp[nk] = st; this.gScore[nk] = ng; this.came[nk] = cur; this.viaDrop[nk] = st
         push(nk, ng + H(nk))
       }
     }
@@ -481,16 +537,29 @@ export class GameMap {
     for (let c = end; c >= 0 && cells.length < N; c = this.came[c]) { cells.push(c); if (c === s) break }
     cells.reverse()
     const pts = cells.map((c) => this.cellXY(c))
+    const landing = cells.map((c, index) => index > 0 && this.viaDrop[c] === st && this.came[c] === cells[index - 1])
     const reached = found && exactGoalAttached
-    if (reached) pts.push([gx, gy])
+    if (reached) { pts.push([gx, gy]); landing.push(false) }
     // Use the original route's cumulative risk to check shortcuts, including their riskiest individual sample.
     const out: Point[] = []
+    const drops: Point[] = []
     let ax = sx, ay = sy
     let i = 0
+    const startClearance = tight ? Math.min(1, this.clearAt(sx, sy) - 0.05) : WALK_CLEARANCE
     while (i < pts.length) {
-      const last = Math.min(pts.length - 1, i + 40)
+      // A ledge hop goes straight from its takeoff cell to its landing; nothing shortcuts it.
+      if (landing[i]) {
+        out.push(pts[i]); drops.push(pts[i])
+        ax = pts[i][0]; ay = pts[i][1]
+        i++
+        continue
+      }
+      // From a tight start, only the hop to the first cell may use the reduced clearance.
+      const fromStart = tight && ax === sx && ay === sy
+      let last = fromStart ? i : Math.min(pts.length - 1, i + 40)
+      for (let k = i + 1; k <= last; k++) if (landing[k]) { last = k - 1; break }
       let j = last
-      if (extraCost) {
+      if (extraCost && !fromStart) {
         const original: RouteRisk[] = []
         let px = ax, py = ay
         for (let k = i; k <= last; k++) {
@@ -514,15 +583,15 @@ export class GameMap {
       } else {
         while (j > i && !this.walkLine(ax, ay, pts[j][0], pts[j][1])) j--
       }
-      if (!this.walkLine(ax, ay, pts[j][0], pts[j][1])) {
-        return out.length ? { points: out, status: "partial" } : unreachable
+      if (!this.walkLine(ax, ay, pts[j][0], pts[j][1], fromStart ? startClearance : WALK_CLEARANCE)) {
+        return out.length ? { points: out, status: "partial", drops } : unreachable
       }
       if (pts[j][0] !== ax || pts[j][1] !== ay) out.push(pts[j])
       ax = pts[j][0]; ay = pts[j][1]
       i = j + 1
     }
-    if (reached) return { points: out, status: "reached" }
-    return out.length ? { points: out, status: "partial" } : unreachable
+    if (reached) return { points: out, status: "reached", drops }
+    return out.length ? { points: out, status: "partial", drops } : unreachable
   }
 }
 

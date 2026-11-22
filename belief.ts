@@ -66,7 +66,10 @@ export class ContactBeliefs {
   private snapshotTime = -Infinity
   private epoch = 0
   private observedSpeed = 0
-  private readonly riskCache = new Map<number, number>()
+  // Per-cell risk cache, invalidated by bumping the stamp (A* queries it very often).
+  private riskValue = new Float32Array(0)
+  private riskStamp = new Int32Array(0)
+  private riskEpoch = 1
 
   constructor(map: GameMap) {
     this.map = map
@@ -185,7 +188,7 @@ export class ContactBeliefs {
     this.snapshotTime = t
     this.hypotheses = [...this.tracks.values()].flatMap(track => this.spread(track, t))
     this.activeSounds = [...this.sounds]
-    this.riskCache.clear()
+    this.riskEpoch++
     this.epoch++
   }
 
@@ -247,8 +250,11 @@ export class ContactBeliefs {
     // Use the finer cell near obstacles so adjacent lanes cannot share a sample
     // snapped to a wall or to its other side.
     const cell = this.map.clearAt(coarseX, coarseY) > RISK_CELL_SIZE ? coarseCell : fineCell
-    const cached = this.riskCache.get(cell)
-    if (cached !== undefined) return cached
+    if (this.riskStamp.length !== this.map.cnx * this.map.cny) {
+      this.riskStamp = new Int32Array(this.map.cnx * this.map.cny)
+      this.riskValue = new Float32Array(this.map.cnx * this.map.cny)
+    }
+    if (this.riskStamp[cell] === this.riskEpoch) return this.riskValue[cell]
     const [sampleX, sampleY] = this.map.cellXY(cell)
     const ground = this.map.floorAt(sampleX, sampleY)
     let score = 0
@@ -290,8 +296,24 @@ export class ContactBeliefs {
       soundRisk = Math.max(soundRisk, cue.strength * confidence(age, SOUND_LIFETIME) * direction * relevance)
     }
     const result = 1 - Math.exp(-score - soundRisk)
-    this.riskCache.set(cell, result)
+    this.riskStamp[cell] = this.riskEpoch
+    this.riskValue[cell] = result
     return result
+  }
+
+  /** The most credible remembered contact position, weighted toward nearby evidence. */
+  strongest(x: number, y: number): { pos: Point; weight: number; age: number } | null {
+    let best: Hypothesis | null = null, score = 0
+    for (const h of this.hypotheses) {
+      const value = h.weight / (1 + Math.hypot(h.pos[0] - x, h.pos[1] - y) / 80)
+      if (value > score) { score = value; best = h }
+    }
+    if (!best) return null
+    let age = Infinity
+    for (const track of this.tracks.values()) {
+      age = Math.min(age, Math.max(0, this.time - track.seenAt) + Math.hypot(track.pos[0] - best.pos[0], track.pos[1] - best.pos[1]) / 40)
+    }
+    return { pos: best.pos, weight: best.weight, age }
   }
 
   scanBearing(x: number, y: number): number | null {

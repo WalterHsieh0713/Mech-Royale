@@ -43,14 +43,26 @@ function onHello(msg: any) {
 
 function handle(lines: string[]) {
   let latest: any = null
+  // Events and sounds are per-observation deltas. Carry those of skipped observations
+  // into the one we answer so damage, kills and footsteps are not lost.
+  let carriedEvents: any[] = []
+  let carriedSounds: any[] = []
   for (const line of lines) {
     let msg: any
     try { msg = JSON.parse(line) } catch { continue }
-    if (msg.type === "hello") onHello(msg)
-    else if (msg.type === "obs") latest = msg
+    if (msg.type === "hello") { onHello(msg); latest = null; carriedEvents = []; carriedSounds = [] }
+    else if (msg.type === "obs") {
+      if (latest) {
+        carriedEvents.push(...(latest.events ?? []))
+        carriedSounds.push(...(latest.sounds ?? []))
+      }
+      latest = msg
+    }
     else if (msg.type === "end") process.exit(0)
   }
   if (!latest) return
+  if (carriedEvents.length) latest.events = [...carriedEvents, ...(latest.events ?? [])]
+  if (carriedSounds.length) latest.sounds = [...carriedSounds.slice(-12), ...(latest.sounds ?? [])]
   // A failed observation cannot safely reuse the last movement or boost request.
   let action: any = { move: [0, 0], boost: false }
   if (bot)

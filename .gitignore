@@ -1,1 +1,4 @@
 node_modules/
+arena/
+sim/.cache/
+sim/results/
