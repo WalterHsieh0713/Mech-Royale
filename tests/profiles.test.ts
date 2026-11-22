@@ -106,3 +106,15 @@ test("the duel profile shoots first at a lone rival that is not watching; surviv
   assert.equal(fixtureBot("duel").act(passingMech()).fire[0], true)
   assert.equal(fixtureBot("survivor").act(passingMech()).fire[0], false)
 })
+
+test("after a kill, the duel profile walks to the dropped cubes where the rival died", () => {
+  const bot = fixtureBot("duel")
+  const rival = passingMech()
+  rival.mechs[0].pos = [35, 0, 0]
+  rival.mechs[0].hp = 40
+  bot.act(rival)
+  const after = observation({ t: 10.2, tick: 612, events: [{ type: "kill", target: 2 }], cubes: [{ id: 7001, pos: [35, 0, 0] }, { id: 7002, pos: [36, 1, 0] }] })
+  let action = bot.act(after)
+  for (let k = 1; k <= 3; k++) action = bot.act(observation({ t: 10.2 + k * 0.1, tick: 612 + 2 * k, cubes: after.cubes }))
+  assert.ok(action.move[0] > 0.5, `expected to head east to the cubes, got ${action.move}`)
+})

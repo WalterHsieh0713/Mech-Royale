@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 import { makeBot } from "../bot.ts"
 import { PROFILES } from "../profile.ts"
 import type { BotFactory } from "./engine.ts"
+import { houseFactory } from "./house.ts"
 
 const here = dirname(fileURLToPath(import.meta.url))
 const LEGACY_REVISION = "0f3e549021181a103bddc1536b67210db611581f"
@@ -39,5 +40,7 @@ export async function agentRegistry(): Promise<Record<string, BotFactory>> {
   for (const name of Object.keys(PROFILES)) registry[name] = (hello, map, rng) => makeBot(hello, map, rng, name)
   const legacy = await legacyFactory()
   if (legacy) registry.legacy = legacy
+  // Practice-lobby stand-ins (sim/house.ts): use as --field house-easy,house-medium,...
+  for (const skill of ["easy", "medium", "hard", "expert"] as const) registry[`house-${skill}`] = houseFactory(skill)
   return registry
 }

@@ -18,6 +18,9 @@ const total = Number(args.get("matches") ?? 4)
 const name = args.get("name") ?? "mr-bot"
 const out = args.get("out") ?? join(root, "sim/results/live.jsonl")
 const sid = randomBytes(16).toString("hex")
+// --code XXXXX joins a private room (made with "Play with friends"); empty seats fill with house bots.
+const code = args.get("code")
+const root2 = args.get("dir")
 
 let played = 0
 let bot: ChildProcess | null = null
@@ -29,9 +32,11 @@ function log(...a: unknown[]) { console.log(new Date().toISOString().slice(11, 1
 function startBot(hello: any) {
   const strategy = strategies[played % strategies.length]
   bot?.kill()
-  const child = spawn(process.execPath, [join(root, "main.ts")], { cwd: root, env: { ...process.env, MR_STRATEGY: strategy }, stdio: ["pipe", "pipe", "pipe"] })
+  const botDir = root2 ?? root
+  const child = spawn(process.execPath, [join(botDir, "main.ts")], { cwd: botDir, env: { ...process.env, MR_STRATEGY: strategy }, stdio: ["pipe", "pipe", "pipe"] })
   bot = child
-  match = { strategy, seed: hello.seed, slot: hello.slot, duration: hello.config?.match?.duration_s, start: Date.now(), place: null, kills: 0, lastObs: null, late: 0, answered: 0, sentAt: 0 }
+  match = { strategy, seed: hello.seed, slot: hello.slot, duration: hello.config?.match?.duration_s, start: Date.now(), place: null, kills: 0, lastObs: null, late: 0, answered: 0, sentAt: 0,
+    dealt: 0, taken: 0, takenBy: {} as Record<string, number>, hits: 0, shots: 0, deathT: null as number | null, minHpSeen: 1, fights: 0 }
   let buf = ""
   child.stdout!.setEncoding("utf8")
   child.stdout!.on("data", (chunk: string) => {
@@ -46,6 +51,7 @@ function startBot(hello: any) {
       const ms = Date.now() - match.sentAt
       match.answered++
       if (ms > 40) match.late++
+      if (Array.isArray(msg.fire) && msg.fire.some(Boolean)) match.shots++
       delete msg.debug
       if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg))
     }
@@ -66,7 +72,8 @@ function finish(results: any) {
   const record = {
     when: new Date().toISOString(), name, strategy: match.strategy, seed: match.seed, place, points: 16 - place,
     kills: match.endMsg?.kills ?? match.kills, cubes: match.lastObs?.self?.cubes ?? null, upgrades: match.lastObs?.self?.upgrades?.length ?? null,
-    lastAlive: match.lastObs?.alive ?? null, lateAnswers: match.late, answers: match.answered,
+    lastAlive: match.lastObs?.alive ?? null, deathT: match.deathT, dealt: Math.round(match.dealt), taken: Math.round(match.taken),
+    takenBy: match.takenBy, hits: match.hits, fireTicks: match.shots, weapons: (match.lastObs?.self?.weapons ?? []).filter(Boolean).map((w: any) => w.kind), lateAnswers: match.late, answers: match.answered,
     field: rows.map((r: any) => r.name ?? r.bot ?? null).filter(Boolean),
   }
   appendFileSync(out, JSON.stringify(record) + "\n")
@@ -77,7 +84,7 @@ function finish(results: any) {
 }
 
 function connect() {
-  ws = new WebSocket(`wss://play.joinbuilders.org/play?token=&sid=${sid}&name=${encodeURIComponent(name)}`)
+  ws = new WebSocket(`wss://play.joinbuilders.org/play?token=&sid=${sid}&name=${encodeURIComponent(name)}${code ? `&code=${code}` : ""}`)
   ws.onclose = (e) => {
     if (played >= total) return
     log("socket closed", e.code, e.reason, "- reconnecting")
@@ -88,16 +95,22 @@ function connect() {
     const msg = JSON.parse(String(e.data))
     if (msg.type === "lobby") {
       if (!msg.you?.ready && played < total) ws.send(JSON.stringify({ type: "ready", name }))
+      // In a private room, start as soon as possible instead of waiting for the countdown.
+      else if (code && msg.you?.ready && !msg.you?.voted && msg.phase !== "running") ws.send(JSON.stringify({ type: "start" }))
     } else if (msg.type === "hello") {
       if (!match || match.seed !== msg.seed) startBot(msg)
     } else if (msg.type === "obs") {
       if (!match || !bot || match.place != null) return
       match.lastObs = msg
-      for (const ev of msg.events ?? []) if (ev.type === "kill") match.kills++
+      for (const ev of msg.events ?? []) {
+        if (ev.type === "kill") match.kills++
+        else if (ev.type === "hit" && ev.target < 1000) { match.dealt += ev.amount ?? 0; match.hits++ }
+        else if (ev.type === "damaged") { match.taken += ev.amount ?? 0; const k = ev.weapon ?? "?"; match.takenBy[k] = (match.takenBy[k] ?? 0) + (ev.amount ?? 0) }
+      }
       match.sentAt = Date.now()
       bot.stdin!.write(JSON.stringify(msg) + "\n")
     } else if (msg.type === "end") {
-      if (match && match.place == null) { match.place = msg.place; match.endMsg = msg; log(`out: place=${msg.place}`) }
+      if (match && match.place == null) { match.place = msg.place; match.endMsg = msg; match.deathT = match.lastObs?.t ?? null; log(`out: place=${msg.place}`) }
       bot?.kill()
     } else if (msg.type === "results") {
       finish(msg)

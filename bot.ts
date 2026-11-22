@@ -509,8 +509,13 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
 
     const visible = [...tracks.values()].filter((track) => track.visible)
     const damageCues = []
+    const killedNow: number[] = []
     for (const e of obs.events) {
-      if (e.type === "kill" && typeof e.target === "number" && e.target < 100) myKills++
+      if (e.type === "kill" && typeof e.target === "number" && e.target < 100) {
+        myKills++
+        killedNow.push(e.target)
+        tracks.delete(e.target)
+      }
       // A healthy mech answers NPCs; a hurt one treats them as any other attacker and leaves.
       if (e.type === "damaged" && typeof e.by === "number" && npcs.has(e.by) && self.hp > self.max_hp * 0.5) {
         // NPCs only defend their patch; answer them without treating it as a player fight.
@@ -536,7 +541,9 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
     for (const [id, tt] of attackers) if (t - tt > 4) attackers.delete(id)
     for (const [id, tt] of takeFail) if (t - tt > 4) takeFail.delete(id)
     for (const [id, tt] of farmCooldowns) if (t >= tt) farmCooldowns.delete(id)
-    beliefs.update(t, self.pos, visible, [...obs.sounds, ...damageCues])
+    // A mech we killed is no threat: without this its last position stayed "dangerous" and
+    // the cubes it dropped there were never worth the trip.
+    beliefs.update(t, self.pos, visible, [...obs.sounds, ...damageCues], killedNow)
 
     // ---- weapons ----
     const W = self.weapons as any[]
@@ -784,6 +791,18 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
         const rank = (candidate: Objective) => candidate.value - d2(candidate.point, position) * 0.25
           - (candidate.kind === "crate" ? 6 : 0)
         for (const candidate of candidates.sort((a, b) => rank(b) - rank(a)).slice(0, 4)) {
+          // Duelling against a squad that hunts us anyway: upgrades beat concealment, so a
+          // nearby cube or weapon with nobody in sight is taken without a cover plan or risk price.
+          const grab = P.duel && visible.length === 0 && (candidate.kind === "cube" || candidate.kind === "loot" || candidate.kind === "drop")
+            && d2(candidate.point, position) < 70
+          if (grab && rank(candidate) > 0) {
+            const route = navigate(position, candidate.point, zone, speed)
+            if (route.status === "reached" && routeTiming(zone, position, route.points, t, speed).minMargin >= margin) {
+              const score = candidate.value - d2(candidate.point, position) * 0.2 + 5
+              if (score > best) { best = score; objective = candidate }
+              continue
+            }
+          }
           if (!cover || rank(candidate) <= 0) continue
           const outward: RoutePlan = candidate.point === position ? { status: "reached", points: [] } : navigate(position, candidate.point, zone, speed)
           if (outward.status !== "reached") continue
@@ -811,7 +830,7 @@ export function makeBot(hello: any, map: GameMap, rng: () => number = Math.rando
           }
         }
       }
-      if (objective && localRisk < 0.55 && currentSlack > 3) {
+      if (objective && (localRisk < 0.55 || (P.duel && visible.length === 0)) && currentSlack > 3) {
         const farm = objective.kind === "crate" || objective.kind === "npc"
         intent = { mode: farm ? "farm" : "collect", goal: objective.point,
           fire: objective.kind === "crate" ? "crate" : objective.kind === "npc" ? "npc" : "quiet", boost: false, reason: objective.kind }
